@@ -39,48 +39,69 @@ async function takeScreenshots(url, page, screenshotsDir) {
     await page.waitForTimeout(1000); // Wait for lazy-loaded images
 
     const sections = await page.evaluate(() => {
-        // A section must be visible and have a meaningful height.
+        // A section must be visible, not fixed, and have a meaningful height.
         const isPotentialSection = (el) => {
-            if (!el) return false;
+            if (!el || typeof el.getBoundingClientRect !== 'function') return false;
             const style = window.getComputedStyle(el);
-            if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+            if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0' || style.position === 'fixed') {
                 return false;
             }
             const rect = el.getBoundingClientRect();
-            return rect.width > 100 && rect.height > 100; // Must have some width and height
+            // A section should have substantial area
+            return (rect.height > 50 && rect.width > 100);
         };
 
-        const getSections = (container) => {
-            return Array.from(container.children).filter(isPotentialSection);
+        const getSections = (container) => Array.from(container.children).filter(isPotentialSection);
+
+        // Start with the body and drill down through single-child wrappers
+        let container = document.body;
+        let candidateElements = getSections(container);
+        while (candidateElements.length === 1) {
+            container = candidateElements[0];
+            candidateElements = getSections(container);
         }
 
-        let container = document.querySelector('main') || document.body;
-        let foundSections = getSections(container);
-
-        // If we only find one section, it's likely a wrapper. Look inside it.
-        if (foundSections.length <= 1) {
-            console.log('Few sections found, trying parent-based analysis...');
-            const parent = foundSections[0] || container;
-            const innerSections = getSections(parent);
-            
-            if (innerSections.length > 1) {
-                foundSections = innerSections;
-            }
+        // If we still have very few sections, try starting from <main>
+        const mainEl = document.querySelector('main');
+        if (candidateElements.length <= 2 && mainEl) {
+             let mainContainer = mainEl;
+             let mainCandidates = getSections(mainContainer);
+             while (mainCandidates.length === 1) {
+                mainContainer = mainCandidates[0];
+                mainCandidates = getSections(mainContainer);
+             }
+             if (mainCandidates.length > candidateElements.length) {
+                candidateElements = mainCandidates;
+             }
         }
         
-        console.log(`Detected ${foundSections.length} final sections.`);
+        // Identify if one of the candidates is a "mega-container" holding the real sections
+        const totalHeight = candidateElements.reduce((sum, el) => sum + el.getBoundingClientRect().height, 0);
+        const megaContainer = candidateElements.find(el => el.getBoundingClientRect().height > totalHeight * 0.8);
+        
+        let finalElements;
+        if (megaContainer) {
+            // If we found a mega-container, its children are the real sections.
+            const innerSections = getSections(megaContainer);
+            // Don't forget any other small sections that were peers to the mega-container (like a footer).
+            const peerSections = candidateElements.filter(el => el !== megaContainer);
+            finalElements = [...innerSections, ...peerSections];
+        } else {
+            // Otherwise, our initial candidates were correct.
+            finalElements = candidateElements;
+        }
 
-        const sectionCoordinates = foundSections.map(el => {
+        // Final sanity check and sort by position on page
+        finalElements = finalElements.filter(el => el.getBoundingClientRect().height > 50);
+        finalElements.sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+
+        return finalElements.map(el => {
             const rect = el.getBoundingClientRect();
             return {
-                x: rect.left,
-                y: rect.top + window.scrollY,
-                width: rect.width,
-                height: rect.height,
+                y_start: rect.top + window.scrollY,
+                y_end: rect.bottom + window.scrollY,
             };
         });
-        
-        return sectionCoordinates;
     });
 
     console.log(`Analysis complete. Found ${sections.length} sections.`);
@@ -95,34 +116,27 @@ async function takeScreenshots(url, page, screenshotsDir) {
     await page.screenshot({ path: masterScreenshotPath, fullPage: true });
     console.log('Master screenshot saved. Slicing sections...');
 
-    const image = sharp(masterScreenshotPath);
-    const metadata = await image.metadata();
-
+    // Use sharp to slice the master screenshot
     for (let i = 0; i < sections.length; i++) {
         const section = sections[i];
         const screenshotPath = path.join(screenshotsDir, `section-${i + 1}.png`);
 
         const clip = {
-            left: Math.floor(section.x),
-            top: Math.floor(section.y),
-            width: Math.floor(section.width),
-            height: Math.floor(section.height)
+            left: 0,
+            top: Math.round(section.y_start),
+            width: 1280, // The viewport width we set
+            height: Math.round(section.y_end - section.y_start)
         };
 
-        // Prevent clipping errors if coordinates are outside the image bounds
-        if (clip.left + clip.width > metadata.width) {
-            clip.width = metadata.width - clip.left;
+        // Skip sections that might be invalid
+        if (clip.height <= 0 || clip.width <= 0) {
+            console.warn(`Skipping invalid section ${i + 1}:`, clip);
+            continue;
         }
-        if (clip.top + clip.height > metadata.height) {
-            clip.height = metadata.height - clip.top;
-        }
-        if (clip.left < 0) clip.left = 0;
-        if (clip.top < 0) clip.top = 0;
-
 
         console.log(`Extracting section ${i + 1} with clip:`, JSON.stringify(clip));
-        await image
-            .clone()
+        
+        await sharp(masterScreenshotPath)
             .extract(clip)
             .toFile(screenshotPath);
             
